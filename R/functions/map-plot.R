@@ -57,10 +57,10 @@ sf::st_boundary(ns_coast_proj)
 
 # Make default base map plot
 xmin2 <- 100000
-xmax2 <- 1171064*0.8
+xmax2 <- 1171064*0.785
 
 ymin2 <- 5326582*1.06
-ymax2 <- 6906891*0.995
+ymax2 <- 6906891*0.986
 
 plot_map <- 
   ggplot(ns_coast_proj) + 
