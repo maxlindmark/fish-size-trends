@@ -1,0 +1,163 @@
+---
+title: "Prepare CPUE data"
+author: "Max Lindmark"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+  df_print: paged
+  code_folding: hide
+pdf_document: default
+editor_options: 
+  chunk_output_type: console
+---
+  
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  fig.align ='center'
+)
+```
+
+## Load libraries
+
+```{r, message=FALSE}
+library(tidyverse)
+library(devtools)
+library(nls.multstart)
+library(broom)
+library(nlstools)
+```
+
+## Read data
+
+```{r fit vbgf}
+bits_ca <- read.csv("data/DATRAS_exchange/bits_ca.csv") %>% filter(Year > 1992) # To match covariates
+
+plaice <- bits_ca %>%
+  filter(SpecCode %in% c("127143", "172902")) %>% 
+  mutate(length_cm = LngtClass,
+         length_cm = ifelse(LngtCode %in% c("0", "."), length_cm/10, length_cm)) %>% 
+  drop_na(Age) %>% 
+  rename(age = Age) %>% 
+  filter(age < 25)
+
+
+# Fit VBGE models
+
+VBGF <- function(age,Linf,k) { 
+  Linf*(1 - exp(-k*(age))) 
+}
+
+fit <- nls_multstart(length_cm ~ VBGF(age, Linf, k),
+                     data = plaice,
+                     iter = 500,
+                     start_lower = c(Linf = 10, k = 0.1),
+                     start_upper = c(Linf = 70, k = 0.6),
+                     supp_errors = 'Y')
+
+preds <- augment(fit)
+
+ggplot() +
+  geom_jitter(data = plaice, aes(age, length_cm), alpha = 0.4, height = 0) +
+  geom_line(data = preds, aes(age, .fitted), color = "tomato3", size = 1)
+
+# Size at age 2?
+predict(fit, new.data = data.frame(age = 2)) %>% 
+  as.data.frame() %>% 
+  summarise(pred = median(.),
+            lwr_pred = quantile(., probs = 0.025),
+            upr_pred = quantile(., probs = 0.975))
+```
+
+```{r, message=FALSE}
+d <- read.csv("data/clean/catch_by_length_q1_q4.csv")
+
+# Add in maturity stage
+d <- d %>% 
+  mutate(maturation_size = NA,
+         maturation_size = ifelse(species == "cod", 30, maturation_size), # Lindmark 2020, van Leeuven 2013
+         maturation_size = ifelse(species == "flounder", 19, maturation_size), # Erlandsson 2017 (median L50)
+         maturation_size = ifelse(species == "plaice", 26, maturation_size), # Estimated above based on WGBFAS 50% of 2 year olds being mature
+         maturation_size = ifelse(species == "dab", 18, maturation_size)) %>% # Stock Annex: Dab (Limanda limanda) in subdivisions 22–32 (Baltic Sea)
+  mutate(life_stage = ifelse(length_cm >= maturation_size, "adult", "juvenile"))
+  
+# Summarise and save size-quantiles (for calculating the metabolic index for representative sizes later on)
+d %>% 
+  mutate(length_cm2 = round(length_cm, digits = 0)) %>% 
+  group_by(length_cm2, species) %>% 
+  summarise(sum_dens = sum(density)) %>% 
+  ggplot(aes(length_cm2, sum_dens)) + 
+  geom_bar(stat = "identity") + 
+  facet_wrap(~species, scales = "free") + 
+  geom_vline(xintercept = 10)
+
+sizes <- d %>% 
+  mutate(length_cm2 = round(length_cm, digits = 0)) %>% 
+  group_by(length_cm2, species) %>% 
+  summarise(sum_dens = sum(density)) %>% 
+  ungroup() %>% 
+  filter(sum_dens > 0) %>% 
+  group_by(species) %>% 
+  mutate(lwr_q = quantile(sum_dens, probs = 0.05)) %>% 
+  ungroup() %>% 
+  filter(sum_dens > lwr_q) %>% 
+  group_by(species) %>% 
+  summarise(max_l = max(length_cm2))
+
+# See script 01_collate_cpue_data_exchange.Rmd for the LW-regression parameters
+sizes <- sizes %>% 
+  mutate(min_l = 10, 
+         mat_l = NA,
+         mat_l = ifelse(species == "cod", 30, mat_l),
+         mat_l = ifelse(species == "flounder", 19, mat_l),
+         mat_l = ifelse(species == "plaice", 26, mat_l),
+         mat_l = ifelse(species == "dab", 18, mat_l),
+         a = NA,
+         a = ifelse(species == "cod", 0.008358197, a),
+         a = ifelse(species == "flounder", 0.009891037, a),
+         a = ifelse(species == "plaice", 0.01782357, a),
+         a = ifelse(species == "dab", 0.008858112, a),
+         b = NA,
+         b = ifelse(species == "cod", 3.034025, b),
+         b = ifelse(species == "flounder", 3.07509, b),
+         b = ifelse(species == "plaice", 3.042893, b),
+         b = ifelse(species == "dab", 3.079707, b),
+         min_w = a*min_l^b,
+         mat_w = a*mat_l^b,
+         max_w = a*max_l^b,
+         juvenile = round((min_w * mat_w)^0.5, digits = -1),
+         adult = round((mat_w * max_w)^0.5, digits = -1)) %>% 
+  dplyr::select(species, juvenile, adult, mat_w) %>% 
+  mutate(mat_w = round(mat_w, digits = -1)) %>% 
+  pivot_longer(c(juvenile, adult), values_to = "B")
+
+write_csv(sizes, "data/clean/sizes.csv")
+
+# Summarize total density by haul, species, life stage
+d_sum <- d %>% 
+  group_by(haul_id, species, life_stage) %>% 
+  summarise(density = sum(density)) %>% 
+  ungroup() %>% 
+  mutate(group = paste(species, life_stage, sep = "_")) %>% 
+  dplyr::select(-life_stage, -species) %>% 
+  pivot_wider(names_from = group, values_from = density)
+
+# Now left join in all other information...
+d_haul <- d %>% 
+  distinct(haul_id, .keep_all = TRUE) %>% 
+  dplyr::select(-density, -species, -length_cm, -maturation_size, -life_stage)
+
+d_haul <- left_join(d_haul, d_sum, by = "haul_id")
+
+# Check distributions of densities across hauls
+d_haul %>% 
+  pivot_longer(c(cod_adult, cod_juvenile, dab_adult, dab_juvenile, flounder_adult, flounder_juvenile, plaice_adult, plaice_juvenile)) %>% 
+  ggplot(aes(log(value))) + 
+  geom_histogram() + 
+  facet_wrap(~name, scales = "free_y")
+
+# Save!
+write_csv(d_haul, "data/clean/catch_clean.csv")
+```
+

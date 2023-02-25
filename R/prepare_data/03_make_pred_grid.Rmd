@@ -1,0 +1,449 @@
+---
+title: "Make the prediction grids"
+author: "Max Lindmark"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+  df_print: paged
+pdf_document: default
+editor_options: 
+  chunk_output_type: console
+---
+  
+```{r setup, include = FALSE, cache=FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  fig.width = 12,
+  fig.asp = 0.618,
+  fig.align ='center'
+)
+```
+
+# Intro
+Make an evenly spaced UTM prediction grid with all spatially varying covariates for the diet and the biomass data
+
+```{r lib, message=FALSE}
+# Load libraries, install if needed
+library(tidyverse)
+library(tidylog)
+library(sp)
+library(raster)
+library(terra)
+library(devtools)
+library(RCurl)
+library(sdmTMB)
+library(terra)
+library(ncdf4)
+library(chron)
+
+# Source code for map plots
+source_url("https://raw.githubusercontent.com/maxlindmark/cod-interactions/main/R/functions/map-plot.R")
+
+# Source code for lon lat to utm
+source_url("https://raw.githubusercontent.com/maxlindmark/cod-interactions/main/R/functions/lon-lat-utm.R")
+
+theme_set(theme_plot())
+```
+
+Read data and depth-raster
+
+```{r}
+# Read data
+d <- read.csv("data/DATRAS_exchange/ibts_hh.csv") %>% 
+  mutate(X = LongLatToUTM(ShootLong, ShootLat, zone = 33)$X / 1000,
+         Y = LongLatToUTM(ShootLong, ShootLat, zone = 33)$Y / 1000) %>% 
+  mutate(haul_loc = paste(Year, X, Y)) %>% 
+  distinct(haul_loc, .keep_all = TRUE) %>% 
+  dplyr::select(X, Y, Year, haul_loc) %>% 
+  rename(year = Year)
+  
+# Load depth nc file
+dep_raster <- terra::rast("data/Mean depth natural colour (with land).nc")
+```
+
+## Make the grid with depth
+First make a grid for the biomass data, then subset that based on the extend of the stomach data
+
+```{r make pred grid}
+x <- d$X
+y <- d$Y
+z <- chull(x, y)
+
+coords <- cbind(x[z], y[z])
+
+coords <- rbind(coords, coords[1, ])
+
+plot(coords[, 1] ~ coords[, 2]) # plot data
+
+sp_poly <- sp::SpatialPolygons(
+  list(sp::Polygons(list(sp::Polygon(coords)), ID = 1))
+  )
+
+sp_poly_df <- sp::SpatialPolygonsDataFrame(sp_poly,
+                                           data = data.frame(ID = 1)
+                                           )
+cell_width <- 3
+
+pred_grid <- expand.grid(
+  X = seq(min(d$X), max(d$X), cell_width),
+  Y = seq(min(d$Y), max(d$Y), cell_width),
+  year = unique(d$year)
+  )
+
+ggplot(pred_grid %>% filter(year == 2019), aes(X, Y)) +
+  geom_point(size = 0.1) +
+  theme_void() +
+  coord_sf()
+
+sp::coordinates(pred_grid) <- c("X", "Y")
+
+inside <- !is.na(sp::over(pred_grid, as(sp_poly_df, "SpatialPolygons")))
+
+pred_grid <- pred_grid[inside, ]
+
+pred_grid <- as.data.frame(pred_grid)
+
+ggplot(data = filter(pred_grid, year == 1999), aes(X*1000, Y*1000)) + 
+  geom_point(size = 0.001, alpha = 0.5) +
+  NULL
+
+plot_map +
+  geom_point(data = filter(pred_grid, year == 1999), aes(X*1000, Y*1000), size = 0.001, alpha = 0.5) +
+  NULL
+
+# Add lat and lon
+# Need to go from UTM to lat long for this one...
+# https://stackoverflow.com/questions/30018098/how-to-convert-utm-coordinates-to-lat-and-long-in-r
+xy <- as.matrix(pred_grid %>% dplyr::select(X, Y) %>% mutate(X = X*1000, Y = Y*1000))
+v <- vect(xy, crs="+proj=utm +zone=33 +datum=WGS84  +units=m")
+y <- project(v, "+proj=longlat +datum=WGS84")
+lonlat <- geom(y)[, c("x", "y")]
+
+pred_grid$lon <- lonlat[, 1]
+pred_grid$lat <- lonlat[, 2]
+
+ggplot(filter(pred_grid, year == 1999), aes(lon, lat)) + geom_point()
+
+# Add depth now to remove islands and remaining land
+pred_grid$depth <- raster::extract(projected_depth_raster,
+                                   pred_grid %>% dplyr::select(X, Y) %>% mutate(X = X*1000, Y = Y*1000))
+
+# Convert to depth (instead of elevation)
+pred_grid <- pred_grid %>% drop_na(depth)
+ggplot(pred_grid, aes(depth)) + geom_histogram()
+pred_grid$depth <- (pred_grid$depth - max(pred_grid$depth)) * -1
+ggplot(pred_grid, aes(depth)) + geom_histogram()
+
+min(pred_grid$depth)
+
+pred_grid %>%
+  filter(year == 1999) %>% 
+  mutate(water = ifelse(depth < 0.00000001, "N", "Y")) %>% 
+  ggplot(aes(X*1000, Y*1000, fill = water)) + 
+  geom_raster() +
+  NULL
+
+pred_grid <- pred_grid %>% filter(depth > 0.00000001)
+
+ggplot(pred_grid, aes(X*1000, Y*1000)) + 
+  geom_point() +
+  NULL
+
+ggplot(pred_grid, aes(X*1000, Y*1000, fill = depth)) + 
+  geom_raster() +
+  NULL
+
+plot_map + 
+  geom_point(data = pred_grid, aes(X*1000, Y*1000), size = 0.001) + 
+  geom_sf()
+```
+
+## Temperature
+
+```{r temperature}
+# Open the netCDF file
+ncin <- nc_open("data/NEMO/cmems_mod_nws_phy-bottomt_my_7km-2D_P1D-m_1677248974249.nc")
+                                        
+print(ncin)
+
+# # Get longitude and latitude
+# lon <- ncvar_get(ncin,"longitude")
+# nlon <- dim(lon)
+# head(lon)
+# 
+# lat <- ncvar_get(ncin,"latitude")
+# nlat <- dim(lat)
+# head(lat)
+# 
+# # Get time
+# time <- ncvar_get(ncin,"time")
+# time
+# 
+# tunits <- ncatt_get(ncin,"time","units")
+# nt <- dim(time)
+# nt
+# tunits
+
+# Get temperature
+dname <- "bottomT"
+
+temp_array <- ncvar_get(ncin,dname)
+dlname <- ncatt_get(ncin,dname,"long_name")
+dunits <- ncatt_get(ncin,dname,"units")
+fillvalue <- ncatt_get(ncin,dname,"_FillValue")
+dim(temp_array)
+
+# Get global attributes
+title <- ncatt_get(ncin,0,"title")
+institution <- ncatt_get(ncin,0,"institution")
+datasource <- ncatt_get(ncin,0,"source")
+references <- ncatt_get(ncin,0,"references")
+history <- ncatt_get(ncin,0,"history")
+Conventions <- ncatt_get(ncin,0,"Conventions")
+
+# Convert time: split the time units string into fields
+# tustr <- strsplit(tunits$value, " ")
+# tdstr <- strsplit(unlist(tustr)[3], "-")
+# tmonth <- as.integer(unlist(tdstr)[2])
+# tday <- as.integer(unlist(tdstr)[3])
+# tyear <- as.integer(unlist(tdstr)[1])
+
+# Here I deviate from the guide a little bit. Save this info:
+dates <- as.POSIXct(time, origin = "1970-01-01")
+
+# Crop the date variable
+months <- as.numeric(substr(dates, 6, 7))
+years <- as.numeric(substr(dates, 1, 4))
+
+# Replace netCDF fill values with NA's
+temp_array[temp_array == fillvalue$value] <- NA
+
+# Next, we need to work with the months that correspond to the quarters that we use.
+# loop through each time step, and if it is a good month save it as a raster.
+months
+
+index_keep_q1 <- which(months < 4)
+index_keep_q3 <- which(months > 6 & months < 10)
+
+temp_q1 <- temp_array[, , index_keep_q1]
+temp_q3 <- temp_array[, , index_keep_q3]
+
+months_keep_q1 <- months[index_keep_q1]
+months_keep_q3 <- months[index_keep_q3]
+
+years_keep_q1 <- years[index_keep_q1]
+years_keep_q3 <- years[index_keep_q3]
+
+# Now we have an array with data for that quarter
+# We need to now calculate the average within a year.
+# Get a sequence that takes every third value between 1: number of months (length)
+loop_seq_q1 <- seq(1, dim(temp_q1)[3], by = 3)
+loop_seq_q3 <- seq(1, dim(temp_q3)[3], by = 3)
+
+loop_seq_q1 <- head(loop_seq_q1, -1)
+loop_seq_q3 <- head(loop_seq_q3, -3)
+
+# Create objects that will hold data
+dlist_q1 <- list()
+dlist_q3 <- list()
+
+temp_1 <- c()
+temp_2 <- c()
+temp_3 <- c()
+temp_ave_q1 <- c()
+
+temp_7 <- c()
+temp_8 <- c()
+temp_9 <- c()
+temp_ave_q3 <- c()
+
+# Now average by quarter. The vector loop_seq_q1 is 1, 4, 7 etc. So first i is 1, 2, 3, which is the index we want. 
+
+for(i in loop_seq_q1) {
+  
+  temp_1 <- temp_q1[, , (i)]
+  temp_2 <- temp_q1[, , (i + 1)]
+  temp_3 <- temp_q1[, , (i + 2)]
+  
+  temp_ave_q1 <- (temp_1 + temp_2 + temp_3) / 3
+  
+  list_pos_q1 <- ((i/3) - (1/3)) + 1 # to get index 1:n(years)
+  
+  dlist_q1[[list_pos_q1]] <- temp_ave_q1
+  
+}
+
+for(i in loop_seq_q3) {
+  
+  temp_7 <- temp_q3[, , (i)]
+  temp_8 <- temp_q3[, , (i + 1)]
+  temp_9 <- temp_q3[, , (i + 2)]
+  
+  temp_ave_q3 <- (temp_7 + temp_8 + temp_9) / 3
+  
+  list_pos_q3 <- ((i/3) - (1/3)) + 1 # to get index 1:n(years)
+  
+  dlist_q3[[list_pos_q3]] <- temp_ave_q3
+  
+}
+
+# Now name the lists with the year:
+names(dlist_q1) <- unique(years_keep_q1)
+names(dlist_q3) <- unique(years_keep_q3)
+
+# Now I need to make a loop where I extract the raster value for each year...
+# The cpue data is called dat so far in this script
+
+# Filter years in the cpue data frame to only have the years I have temperature for
+d_sub_temp_q1 <- dat_haul %>% filter(quarter == 1) %>% filter(year %in% names(dlist_q1)) %>% droplevels()
+d_sub_temp_q3 <- dat_haul %>% filter(quarter == 4) %>% filter(year %in% names(dlist_q4)) %>% droplevels()
+
+# Create data holding object
+temp_data_list_q1 <- list()
+temp_data_list_q3 <- list()
+
+# ... And for the temperature raster
+raster_list_q1 <- list()
+raster_list_q3 <- list()
+
+# Create factor year for indexing the list in the loop
+d_sub_temp_q1$year_f <- as.factor(d_sub_temp_q1$year)
+d_sub_temp_q3$year_f <- as.factor(d_sub_temp_q3$year)
+
+# Loop through each year and extract raster values for the cpue data points
+for(i in unique(d_sub_temp_q1$year_f)) {
+  
+  # Set plot limits
+  #ymin = 54; ymax = 58; xmin = 12; xmax = 22
+  
+  # Subset a year
+  temp_slice_q1 <- dlist_q1[[i]]
+  temp_slice_q3 <- dlist_q3[[i]]
+  
+  # Create raster for that year (i)
+  r_q1 <- raster(t(temp_slice_q1), xmn = min(lon), xmx = max(lon), ymn = min(lat), ymx = max(lat),
+                 crs = CRS("+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs+ towgs84=0,0,0"))
+  r_q3 <- raster(t(temp_slice_q3), xmn = min(lon), xmx = max(lon), ymn = min(lat), ymx = max(lat),
+                 crs = CRS("+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs+ towgs84=0,0,0"))
+  
+  # Flip...
+  r_q1 <- flip(r_q1, direction = 'y')
+  r_q3 <- flip(r_q3, direction = 'y')
+  
+  plot(r_q1, main = paste(i, "Q1"))
+  plot(r_q3, main = paste(i, "Q3"))
+  
+  # Filter the same year (i) in the cpue data and select only coordinates
+  d_slice_q1 <- d_sub_temp_q1 %>% filter(year_f == i) %>% dplyr::select(lon, lat)
+  d_slice_q3 <- d_sub_temp_q3 %>% filter(year_f == i) %>% dplyr::select(lon, lat)
+  
+  # Make into a SpatialPoints object
+  data_sp_q1 <- SpatialPoints(d_slice_q1)
+  data_sp_q3 <- SpatialPoints(d_slice_q3)
+  
+  # Extract raster value (temperature)
+  rasValue_q1 <- raster::extract(r_q1, data_sp_q1)
+  rasValue_q3 <- raster::extract(r_q3, data_sp_q3)
+  
+  # Now we want to plot the results of the raster extractions by plotting the cpue
+  # data points over a raster and saving it for each year.
+  # Make the SpatialPoints object into a raster again (for pl)
+  df_q1 <- as.data.frame(data_sp_q1)
+  df_q3 <- as.data.frame(data_sp_q3)
+  
+  # Add in the raster value in the df holding the coordinates for the cpue data
+  d_slice_q1$temp <- rasValue_q1
+  d_slice_q3$temp <- rasValue_q3
+  
+  # Add in which year
+  d_slice_q1$year <- i
+  d_slice_q3$year <- i
+  
+  # Create a index for the data last where we store all years (because our loop index
+  # i is not continuous, we can't use it directly)
+  index_q1 <- as.numeric(d_slice_q1$year)[1] - 1992
+  index_q3 <- as.numeric(d_slice_q3$year)[1] - 1992
+  
+  # Add each years' data in the list
+  temp_data_list_q1[[index_q1]] <- d_slice_q1
+  temp_data_list_q3[[index_q3]] <- d_slice_q3
+  
+}
+
+# Now create a data frame from the list of all annual values
+big_dat_temp_q1 <- dplyr::bind_rows(temp_data_list_q1)
+big_dat_temp_q3 <- dplyr::bind_rows(temp_data_list_q3)
+big_dat_temp <- bind_rows(mutate(big_dat_temp_q1, quarter = 1),
+                          mutate(big_dat_temp_q3, quarter = 3))
+```
+
+
+```{r merge oxy, temp and salinity data with fish data}
+big_dat_temp <- big_dat_temp %>% mutate(id_env = paste(year, quarter, X, Y, sep = "_"))
+
+dat <- dat %>%
+  mutate(id_env = paste(year, quarter, X*1000, Y*1000, sep = "_")) %>% 
+  left_join(env_dat) %>%
+  dplyr::select(-id_env)
+
+dat <- dat %>% drop_na(temp)
+
+# Temperature
+plot_map_fc + 
+  geom_raster(data = filter(dat, quarter == 4), aes(X*1000, Y*1000, fill = temp)) + 
+  facet_wrap(~year)
+
+pred_grid <- dat
+```
+
+## Add ICES areas
+
+```{r ices areas}
+# https://stackoverflow.com/questions/34272309/extract-shapefile-value-to-point-with-r
+# https://gis.ices.dk/sf/
+shape <- shapefile("data/ICES_StatRec_mapto_ICES_Areas/StatRec_map_Areas_Full_20170124.shp")
+head(shape)
+
+pts <- SpatialPoints(cbind(pred_grid$lon, pred_grid$lat), 
+                     proj4string = CRS(proj4string(shape)))
+
+pred_grid$subdiv <- over(pts, shape)$Area_27
+
+# Rename subdivisions to the more common names and do some more filtering (by sub div and area)
+sort(unique(pred_grid$subdiv))
+
+pred_grid <- pred_grid %>% 
+  mutate(sub_div = factor(subdiv),
+         sub_div = fct_recode(subdiv,
+                              "24" = "3.d.24",
+                              "25" = "3.d.25",
+                              "26" = "3.d.26",
+                              "27" = "3.d.27",
+                              "28" = "3.d.28.1",
+                              "28" = "3.d.28.2",
+                              "29" = "3.d.29"),
+         sub_div = as.character(sub_div)) %>% 
+  filter(sub_div %in% c("24", "25", "26", "27", "28", 2)) %>% 
+  filter(lat > 54 & lat < 59 & lon < 22)
+
+# Add ICES rectangles
+pred_grid$ices_rect <- mapplots::ices.rect2(lon = pred_grid$lon, lat = pred_grid$lat)
+
+plot_map +
+  geom_raster(data = filter(pred_grid, year == 1999), aes(X*1000, Y*1000, fill = oxy)) +
+  facet_wrap(~sub_div)
+
+pred_grid <- pred_grid %>% dplyr::select(-subdiv)
+```
+
+## Save
+
+```{r save}
+# Remove variables and save
+pred_grid_93_06 <- pred_grid %>% filter(year < 2007)
+pred_grid_07_19 <- pred_grid %>% filter(year > 2006)
+
+write.csv(pred_grid_93_06, file = "data/clean/pred_grid_(1_2).csv", row.names = FALSE)
+write.csv(pred_grid_07_19, file = "data/clean/pred_grid_(2_2).csv", row.names = FALSE)
+```
