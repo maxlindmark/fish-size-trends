@@ -68,7 +68,6 @@ plot_map <-
   ylim(ymin2, ymax2) +
   labs(x = "Longitude", y = "Latitude") +
   geom_sf(size = 0.3) + 
-  geom_point(data = d, aes(X*1000, Y*1000)) +
   theme_plot() +
   guides(colour = guide_colorbar(title.position = "top", title.hjust = 0.5),
          fill = guide_colorbar(title.position = "top", title.hjust = 0.5)) +
