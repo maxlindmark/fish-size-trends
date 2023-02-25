@@ -3,7 +3,7 @@ library(sf)
 sf::sf_use_s2(FALSE)
 
 # Specify map ranges
-ymin = 48; ymax = 64; xmin = -8; xmax = 12
+ymin = 48; ymax = 64; xmin = -8; xmax = 14
 
 map_data <- rnaturalearth::ne_countries(
   scale = "medium",
@@ -56,18 +56,19 @@ theme_facet_map <- function(base_size = 11, base_family = "") {
 sf::st_boundary(ns_coast_proj)
 
 # Make default base map plot
-xmin2 <- -73777.38*8.5
-xmax2 <- 1171064*0.15
+xmin2 <- 100000
+xmax2 <- 1171064*0.8
 
-ymin2 <- 5326582*1.08
-ymax2 <- 6906891*0.99
+ymin2 <- 5326582*1.06
+ymax2 <- 6906891*0.995
 
 plot_map <- 
-  ggplot(swe_coast_proj) + 
+  ggplot(ns_coast_proj) + 
   xlim(xmin2, xmax2) +
   ylim(ymin2, ymax2) +
   labs(x = "Longitude", y = "Latitude") +
   geom_sf(size = 0.3) + 
+  geom_point(data = d, aes(X*1000, Y*1000)) +
   theme_plot() +
   guides(colour = guide_colorbar(title.position = "top", title.hjust = 0.5),
          fill = guide_colorbar(title.position = "top", title.hjust = 0.5)) +
