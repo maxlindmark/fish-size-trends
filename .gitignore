@@ -41,3 +41,8 @@ vignettes/*.pdf
 # Ignore all files named .DS_Store or ending with .log
 **/.DS_Store
 **.log
+
+### Ignore LatAge folders
+
+/L_At_Age/
+/L_At_Age_strict/
