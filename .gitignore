@@ -46,3 +46,7 @@ vignettes/*.pdf
 
 /L_At_Age/
 /L_At_Age_strict/
+
+## Ignore raw trawl data
+/Data/Surveys_strict.Rdata
+/Data/Surveys_nostrict.Rdata
